@@ -5,14 +5,13 @@ import {
   GoogleGenerativeAIEmbeddings,
 } from "@langchain/google-genai";
 import { PineconeStore } from "@langchain/pinecone";
-import { combineDocumentsFn, makeChain } from "@/utils/makechain";
+import { combineDocumentsFn } from "@/utils/makechain";
 import { pinecone } from "@/utils/pinecone-client";
 import { PINECONE_INDEX_NAME, PINECONE_NAME_SPACE } from "@/config/pinecone";
 import { HumanMessage } from "@langchain/core/messages";
 import puppeteer from "puppeteer";
-import { Crawl4AI } from "crawl4ai";
 
-// Hardcoded URLs to fetch content from
+// URLs to crawl if Pinecone fails
 const urlsToVisit = ["https://radheshrinivasafoundation.com/"];
 
 export async function crawlWebsite(
@@ -28,14 +27,14 @@ export async function crawlWebsite(
   const toVisit: string[] = [startUrl];
   const origin = new URL(startUrl).origin;
 
-  function normalizeUrl(url: string) {
+  const normalizeUrl = (url: string) => {
     try {
       const u = new URL(url, origin);
-      return u.origin + u.pathname; // remove hashes & query params
+      return u.origin + u.pathname;
     } catch {
       return null;
     }
-  }
+  };
 
   while (toVisit.length > 0 && visited.size < maxPages) {
     const url = toVisit.shift()!;
@@ -47,14 +46,11 @@ export async function crawlWebsite(
       page.setDefaultNavigationTimeout(60000);
       await page.goto(url, { waitUntil: "networkidle2" });
 
-      // Wait a bit for SPA JS to render links
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      // Extract all links
+      // Extract links
       const links: string[] = await page.evaluate(() =>
         Array.from(document.querySelectorAll("a[href]"))
           .map((a) => a.getAttribute("href") || "")
-          .filter((href) => !!href)
+          .filter(Boolean)
       );
 
       for (const link of links) {
@@ -85,10 +81,8 @@ export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
 
   for (const url of urls) {
     try {
-      console.log("Visiting:", url);
       const page = await browser.newPage();
       page.setDefaultNavigationTimeout(60000);
-
       await page.goto(url, { waitUntil: "networkidle2" });
 
       const pageText = await page.evaluate(() => {
@@ -96,25 +90,18 @@ export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
         return main ? main.innerText : document.body.innerText || "";
       });
 
-      // Clean and chunk the text for better retrieval
       const cleanedText = pageText.replace(/\s+/g, " ").trim();
 
-      // Create multiple documents by chunking the content
-      const chunkSize = 1000; // characters per chunk
-      const overlap = 200; // overlap between chunks
+      const chunkSize = 1000;
+      const overlap = 200;
 
       for (let i = 0; i < cleanedText.length; i += chunkSize - overlap) {
         const chunk = cleanedText.substring(i, i + chunkSize);
         if (chunk.length > 100) {
-          // Only include substantial chunks
           documents.push(
             new Document({
               pageContent: chunk,
-              metadata: {
-                source: url,
-                chunkIndex: i,
-                type: "web_content",
-              },
+              metadata: { source: url, chunkIndex: i, type: "web_content" },
             })
           );
         }
@@ -127,9 +114,9 @@ export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
   }
 
   await browser.close();
-  console.log("Total document chunks created:", documents.length);
   return documents;
 }
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
@@ -148,151 +135,108 @@ export default async function handler(
   const sanitizedQuestion = question.trim().replaceAll("\n", " ");
 
   try {
+    // Pinecone setup
     const index = pinecone.Index(PINECONE_INDEX_NAME);
     const embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: process.env.GEMINI_API_KEY!,
       model: "text-embedding-004",
     });
 
-    // Create vector store
     const vectorStore = await PineconeStore.fromExistingIndex(embeddings, {
       pineconeIndex: index,
       textKey: "text",
       namespace: PINECONE_NAME_SPACE,
     });
 
-    // Capture retrieved documents
-    let resolveWithDocuments: (value: Document[]) => void;
-    const documentPromise = new Promise<Document[]>((resolve) => {
-      resolveWithDocuments = resolve;
-    });
-
-    const retriever = vectorStore.asRetriever({
-      callbacks: [
-        {
-          handleRetrieverEnd(documents) {
-            resolveWithDocuments(documents);
-          },
-        },
-      ],
-    });
-
+    const retriever = vectorStore.asRetriever();
     const pineconeDocs = await retriever.invoke(sanitizedQuestion);
 
-    // Compute a relevance score for each document
+    // Score and filter
     const scoredDocs = pineconeDocs.map((doc) => {
       const questionWords = sanitizedQuestion.toLowerCase().split(/\s+/);
       const content = doc.pageContent.toLowerCase();
-
       const score = questionWords.filter(
-        (word) => content.includes(word) && word.length > 1
+        (w) => content.includes(w) && w.length > 1
       ).length;
-
       return { doc, score };
     });
 
-    // Filter only highly relevant docs
     const relevantDocs = scoredDocs
-      .filter((d) => d.score > 1) // you can tweak the threshold
+      .filter((d) => d.score > 0)
       .map((d) => d.doc);
 
-    console.log(`Found ${relevantDocs.length} relevant Pinecone documents`);
+    const contextText =
+      relevantDocs.length > 0 ? combineDocumentsFn(relevantDocs) : "";
 
-    if (relevantDocs.length === 0) {
-      // Pinecone didn't have good answers, so crawl the website
-      console.log("No relevant Pinecone docs found, crawling website...");
+    // Combine past messages
+    const pastMessages = history
+      .map(([q, a]) => `Human: ${q}\nAssistant: ${a}`)
+      .join("\n\n");
 
+    const model = new ChatGoogleGenerativeAI({
+      apiKey: process.env.GOOGLE_API_KEY,
+      model: "gemini-2.5-flash",
+      temperature: 0.1,
+    });
+
+    // Attempt answer from Pinecone context
+    let answer = "";
+    if (contextText) {
+      const prompt = `
+You are a helpful AI assistant. Use the following context and conversation history to answer the question. 
+Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history.
+
+Context:
+${contextText}
+
+Conversation history:
+${pastMessages || "No prior history."}
+
+Current question:
+Human: ${sanitizedQuestion}
+Assistant:
+`;
+      const raw = await model.invoke([new HumanMessage(prompt)]);
+      answer = typeof raw === "string" ? raw : (raw?.text ?? "");
+    }
+
+    // If Pinecone answer is weak, crawl website
+    if (answer.includes("The provided information does not contain")) {
+      console.log("Pinecone answer insufficient, crawling website...");
       const allUrls: string[] = [];
       for (const domain of urlsToVisit) {
-        const domainUrls = await crawlWebsite(domain, 50); // max 50 pages per domain
+        const domainUrls = await crawlWebsite(domain, 50);
         allUrls.push(...domainUrls);
       }
 
-      const webDocuments = await fetchMultiplePages(allUrls);
+      const webDocs = await fetchMultiplePages(allUrls);
+      const webContext = combineDocumentsFn(webDocs);
 
-      // Optional: do the same relevance scoring for web docs
-      const scoredWebDocs = webDocuments.map((doc) => {
-        const questionWords = sanitizedQuestion.toLowerCase().split(/\s+/);
-        const content = doc.pageContent.toLowerCase();
+      const prompt = `
+You are a helpful AI assistant. Use the following web content and conversation history to answer the question. 
+Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history.
 
-        const score = questionWords.filter(
-          (word) => content.includes(word) && word.length > 3
-        ).length;
+Context:
+${webContext}
 
-        return { doc, score };
-      });
-
-      relevantDocs.push(
-        ...scoredWebDocs.filter((d) => d.score > 1).map((d) => d.doc)
-      );
-
-      console.log(`Found ${relevantDocs.length} relevant web documents`);
-    }
-
-    let contextText =
-      relevantDocs.length > 0 ? combineDocumentsFn(relevantDocs) : "";
-
-    // Use the chain with the combined context
-    const chain = makeChain(retriever);
-
-    const pastMessages = history
-      .map((message: [string, string]) =>
-        [`Human: ${message[0]}`, `Assistant: ${message[1]}`].join("\n")
-      )
-      .join("\n");
-    let response: string;
-    if (contextText) {
-      // Force the model to use the provided context
-      const enhancedPrompt = `You are a helpful AI assistant. Use the following context and conversation history to answer the question. Do not say "I don't know" and do not mention the source explicitly. 
-
-Past conversation:
+Conversation history:
 ${pastMessages || "No prior history."}
-<context>
-${contextText}
-</context>
 
+Current question:
 Human: ${sanitizedQuestion}
+Assistant:
+`;
 
-Answer:`;
-
-      const model = new ChatGoogleGenerativeAI({
-        apiKey: process.env.GOOGLE_API_KEY,
-        model: "gemini-2.5-flash",
-        temperature: 0.1, // Lower temperature for more factual responses
-      });
-
-      const rawResponse = await model.invoke([
-        new HumanMessage(enhancedPrompt),
-      ]);
-      response =
-        typeof rawResponse === "string"
-          ? rawResponse
-          : (rawResponse?.text ?? "");
-    } else {
-      // Fallback to general knowledge
-      const model = new ChatGoogleGenerativeAI({
-        apiKey: process.env.GOOGLE_API_KEY,
-        model: "gemini-2.5-flash",
-        temperature: 0.2,
-      });
-
-      const rawResponse = await model.invoke([
-        new HumanMessage(sanitizedQuestion),
-      ]);
-      response =
-        typeof rawResponse === "string"
-          ? rawResponse
-          : (rawResponse?.text ?? "");
+      const raw = await model.invoke([new HumanMessage(prompt)]);
+      answer = typeof raw === "string" ? raw : (raw?.text ?? "");
     }
-
-    const sourceDocuments = await documentPromise;
 
     res.status(200).json({
-      text: response,
-      sourceDocuments: relevantDocs.slice(0, 5), // Return top 5 relevant docs
+      text: answer,
+      sourceDocuments: relevantDocs.slice(0, 5),
     });
-  } catch (error: any) {
-    console.error("Error in handler:", error);
-    res.status(500).json({ error: error.message || "Something went wrong" });
+  } catch (err: any) {
+    console.error("Error in handler:", err);
+    res.status(500).json({ error: err.message || "Something went wrong" });
   }
 }
