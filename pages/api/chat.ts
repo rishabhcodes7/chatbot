@@ -10,7 +10,6 @@ import { pinecone } from "@/utils/pinecone-client";
 import { PINECONE_INDEX_NAME, PINECONE_NAME_SPACE } from "@/config/pinecone";
 import { HumanMessage } from "@langchain/core/messages";
 import puppeteer from "puppeteer";
-import { CheerioCrawler } from "crawlee";
 import { Crawl4AI } from "crawl4ai";
 
 // Hardcoded URLs to fetch content from
@@ -179,49 +178,56 @@ export default async function handler(
     });
 
     const pineconeDocs = await retriever.invoke(sanitizedQuestion);
-    let relevantDocs;
-    // Enhanced filtering for better relevance
-    relevantDocs = pineconeDocs.filter((doc) => {
+
+    // Compute a relevance score for each document
+    const scoredDocs = pineconeDocs.map((doc) => {
       const questionWords = sanitizedQuestion.toLowerCase().split(/\s+/);
       const content = doc.pageContent.toLowerCase();
 
-      // Score documents based on keyword matches
       const score = questionWords.filter(
-        (word) => content.includes(word) && word.length > 3
+        (word) => content.includes(word) && word.length > 1
       ).length;
 
-      return score > 0 || content.length > 200; // Include substantial documents
+      return { doc, score };
     });
 
-    console.log(`Found ${relevantDocs.length} relevant documents`);
+    // Filter only highly relevant docs
+    const relevantDocs = scoredDocs
+      .filter((d) => d.score > 1) // you can tweak the threshold
+      .map((d) => d.doc);
 
-    //if (relevantDocs.length) {
-    // Fetch website content
-    console.log("Fetching website content...");
-    const allUrls: string[] = [];
-    for (const domain of urlsToVisit) {
-      const domainUrls = await crawlWebsite(domain, 50); // max 50 pages per domain
-      allUrls.push(...domainUrls);
+    console.log(`Found ${relevantDocs.length} relevant Pinecone documents`);
+
+    if (relevantDocs.length === 0) {
+      // Pinecone didn't have good answers, so crawl the website
+      console.log("No relevant Pinecone docs found, crawling website...");
+
+      const allUrls: string[] = [];
+      for (const domain of urlsToVisit) {
+        const domainUrls = await crawlWebsite(domain, 50); // max 50 pages per domain
+        allUrls.push(...domainUrls);
+      }
+
+      const webDocuments = await fetchMultiplePages(allUrls);
+
+      // Optional: do the same relevance scoring for web docs
+      const scoredWebDocs = webDocuments.map((doc) => {
+        const questionWords = sanitizedQuestion.toLowerCase().split(/\s+/);
+        const content = doc.pageContent.toLowerCase();
+
+        const score = questionWords.filter(
+          (word) => content.includes(word) && word.length > 3
+        ).length;
+
+        return { doc, score };
+      });
+
+      relevantDocs.push(
+        ...scoredWebDocs.filter((d) => d.score > 1).map((d) => d.doc)
+      );
+
+      console.log(`Found ${relevantDocs.length} relevant web documents`);
     }
-
-    const webDocuments = await fetchMultiplePages(allUrls);
-
-    console.log("webDocuments: ", webDocuments);
-
-    relevantDocs = webDocuments.filter((doc) => {
-      const questionWords = sanitizedQuestion.toLowerCase().split(/\s+/);
-      const content = doc.pageContent.toLowerCase();
-
-      // Score documents based on keyword matches
-      const score = questionWords.filter(
-        (word) => content.includes(word) && word.length > 3
-      ).length;
-
-      return score > 0 || content.length > 200; // Include substantial documents
-    });
-
-    console.log(`Found ${relevantDocs.length} relevant web documents`);
-    // }
 
     let contextText =
       relevantDocs.length > 0 ? combineDocumentsFn(relevantDocs) : "";
@@ -237,7 +243,7 @@ export default async function handler(
     let response: string;
     if (contextText) {
       // Force the model to use the provided context
-      const enhancedPrompt = `Use the following context to answer the question. If the answer is in the context, use it. Otherwise, use your general knowledge.Do NOT mention the source, context, or what information is available. Do NOT say "I don't know" or "based on the context". Just answer directly.Also use the history of the chat to answer the questions. Don't just give the previous answer if the user asked to explain it. 
+      const enhancedPrompt = `You are a helpful AI assistant. Use the following context and conversation history to answer the question. Do not say "I don't know" and do not mention the source explicitly. 
 
 Past conversation:
 ${pastMessages || "No prior history."}
