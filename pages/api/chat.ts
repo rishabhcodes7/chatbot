@@ -16,7 +16,7 @@ const urlsToVisit = ["https://radheshrinivasafoundation.com/"];
 
 export async function crawlWebsite(
   startUrl: string,
-  maxPages = 50
+  maxPages = 200
 ): Promise<string[]> {
   const browser = await puppeteer.launch({
     headless: true,
@@ -30,7 +30,7 @@ export async function crawlWebsite(
   const normalizeUrl = (url: string) => {
     try {
       const u = new URL(url, origin);
-      return u.origin + u.pathname;
+      return u.href.split("#")[0]; // keep query params but strip hashes
     } catch {
       return null;
     }
@@ -44,13 +44,15 @@ export async function crawlWebsite(
     try {
       const page = await browser.newPage();
       page.setDefaultNavigationTimeout(60000);
-      await page.goto(url, { waitUntil: "networkidle2" });
+      await page.goto(normalizedUrl, { waitUntil: "networkidle2" });
 
-      // Extract links
+      // Extract ALL links as absolute
       const links: string[] = await page.evaluate(() =>
         Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => a.getAttribute("href") || "")
-          .filter(Boolean)
+          .map((a) => (a as HTMLAnchorElement).href)
+          .filter(
+            (href) => href.startsWith("http") && !href.startsWith("javascript:")
+          )
       );
 
       for (const link of links) {
@@ -184,7 +186,7 @@ export default async function handler(
     if (contextText) {
       const prompt = `
 You are a helpful AI assistant. Use the following context and conversation history to answer the question. 
-Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history.
+Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history. Use your general knowledge to answer the question, if the answer is not found in pinecone documents or in website crwaling.Go to the website crawling if you don't have answer to the question. Never say I don't know or similar words.Make the answer empty string if you don't know the answer.
 
 Context:
 ${contextText}
@@ -201,7 +203,7 @@ Assistant:
     }
 
     // If Pinecone answer is weak, crawl website
-    if (answer.includes("The provided information does not contain")) {
+    if (!answer) {
       console.log("Pinecone answer insufficient, crawling website...");
       const allUrls: string[] = [];
       for (const domain of urlsToVisit) {
@@ -210,6 +212,7 @@ Assistant:
       }
 
       const webDocs = await fetchMultiplePages(allUrls);
+      console.log("Web Docs: ", webDocs);
       const webContext = combineDocumentsFn(webDocs);
 
       const prompt = `
