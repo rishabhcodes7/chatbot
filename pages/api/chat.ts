@@ -12,7 +12,7 @@ import { HumanMessage } from "@langchain/core/messages";
 import puppeteer from "puppeteer";
 
 // URLs to crawl if Pinecone fails
-const urlsToVisit = ["https://radheshrinivasafoundation.com/"];
+const urlsToVisit = ["https://www.codesfortomorrow.com"];
 
 export async function crawlWebsite(
   startUrl: string,
@@ -30,16 +30,32 @@ export async function crawlWebsite(
   const normalizeUrl = (url: string) => {
     try {
       const u = new URL(url, origin);
-      return u.href.split("#")[0]; // keep query params but strip hashes
+      // Normalize by removing trailing slashes and standardizing
+      let normalized = u.href.split("#")[0]; // strip hashes
+      // Remove trailing slash for consistency
+      normalized = normalized.replace(/\/$/, "");
+      return normalized;
     } catch {
       return null;
     }
   };
 
+  const startNormalized = normalizeUrl(startUrl);
+  if (!startNormalized) {
+    await browser.close();
+    return [];
+  }
+
   while (toVisit.length > 0 && visited.size < maxPages) {
     const url = toVisit.shift()!;
     const normalizedUrl = normalizeUrl(url);
-    if (!normalizedUrl || visited.has(normalizedUrl)) continue;
+
+    if (!normalizedUrl || visited.has(normalizedUrl)) {
+      console.log("Skipping URL (already visited or invalid):", normalizedUrl);
+      continue;
+    }
+
+    console.log("Crawling URL:", normalizedUrl);
 
     try {
       const page = await browser.newPage();
@@ -49,31 +65,50 @@ export async function crawlWebsite(
       // Extract ALL links as absolute
       const links: string[] = await page.evaluate(() =>
         Array.from(document.querySelectorAll("a[href]"))
-          .map((a) => (a as HTMLAnchorElement).href)
-          .filter(
-            (href) => href.startsWith("http") && !href.startsWith("javascript:")
-          )
+          .map((a) => (a as HTMLAnchorElement).getAttribute("href"))
+          .filter((href) => href && !href.startsWith("javascript:"))
+          .map((href) => {
+            try {
+              return new URL(href!, window.location.origin).href;
+            } catch {
+              return null;
+            }
+          })
+          .filter((href): href is string => href !== null)
       );
 
+      // Add new links to visit queue
       for (const link of links) {
         const nUrl = normalizeUrl(link);
-        if (nUrl && nUrl.startsWith(origin) && !visited.has(nUrl)) {
+        if (
+          nUrl &&
+          nUrl.startsWith(origin) &&
+          !visited.has(nUrl) &&
+          !toVisit.includes(nUrl)
+        ) {
           toVisit.push(nUrl);
         }
       }
 
       visited.add(normalizedUrl);
+      console.log(`Visited ${visited.size} pages so far`);
       await page.close();
     } catch (err) {
       console.error("Failed to crawl URL:", url, err);
+      visited.add(normalizedUrl); // Mark as visited even if failed to avoid retries
     }
   }
 
   await browser.close();
+  console.log(`Crawling completed. Total pages visited: ${visited.size}`);
   return Array.from(visited);
 }
 
 export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
+  // Remove duplicates before processing
+  const uniqueUrls = [...new Set(urls)];
+  console.log(`Fetching content from ${uniqueUrls.length} unique URLs`);
+
   const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -81,31 +116,58 @@ export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
 
   const documents: Document[] = [];
 
-  for (const url of urls) {
+  for (const url of uniqueUrls) {
     try {
       const page = await browser.newPage();
       page.setDefaultNavigationTimeout(60000);
       await page.goto(url, { waitUntil: "networkidle2" });
 
       const pageText = await page.evaluate(() => {
-        const main = document.querySelector("main");
-        return main ? main.innerText : document.body.innerText || "";
+        // Try to get main content areas first
+        const selectors = [
+          "main",
+          "article",
+          ".content",
+          "#content",
+          ".main-content",
+          "[role='main']",
+        ];
+
+        for (const selector of selectors) {
+          const element = document.querySelector(selector);
+          if (element && element.textContent?.trim().length > 100) {
+            return element.textContent;
+          }
+        }
+
+        // Fallback to body
+        return document.body.textContent || "";
       });
 
       const cleanedText = pageText.replace(/\s+/g, " ").trim();
 
-      const chunkSize = 1000;
-      const overlap = 200;
+      if (cleanedText.length > 50) {
+        // Only process if there's substantial content
+        const chunkSize = 1000;
+        const overlap = 200;
 
-      for (let i = 0; i < cleanedText.length; i += chunkSize - overlap) {
-        const chunk = cleanedText.substring(i, i + chunkSize);
-        if (chunk.length > 100) {
-          documents.push(
-            new Document({
-              pageContent: chunk,
-              metadata: { source: url, chunkIndex: i, type: "web_content" },
-            })
-          );
+        for (let i = 0; i < cleanedText.length; i += chunkSize - overlap) {
+          const chunk = cleanedText.substring(i, i + chunkSize);
+          if (chunk.length > 100) {
+            documents.push(
+              new Document({
+                pageContent: chunk,
+                metadata: {
+                  source: url,
+                  chunkIndex: i,
+                  type: "web_content",
+                  totalChunks: Math.ceil(
+                    cleanedText.length / (chunkSize - overlap)
+                  ),
+                },
+              })
+            );
+          }
         }
       }
 
@@ -116,6 +178,7 @@ export async function fetchMultiplePages(urls: string[]): Promise<Document[]> {
   }
 
   await browser.close();
+  console.log(`Created ${documents.length} document chunks`);
   return documents;
 }
 
@@ -186,7 +249,7 @@ export default async function handler(
     if (contextText) {
       const prompt = `
 You are a helpful AI assistant. Use the following context and conversation history to answer the question. 
-Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history. Use your general knowledge to answer the question, if the answer is not found in pinecone documents or in website crwaling.Go to the website crawling if you don't have answer to the question. Never say I don't know or similar words.Make the answer empty string if you don't know the answer.
+Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history. Use your general knowledge to answer the question, if the answer is not found in pinecone documents or in website crwaling.Go to the website crawling if you don't have answer to the question. Never say I don't know or similar words.Make the answer empty string if you don't know the answer.Use previous context also.
 
 Context:
 ${contextText}
