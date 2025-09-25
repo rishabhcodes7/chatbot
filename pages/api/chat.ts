@@ -281,7 +281,6 @@ Assistant:
       const prompt = `
 You are a helpful AI assistant. Use the following web content and conversation history to answer the question. 
 Do not say "I don't know" and do not mention the source explicitly. Resolve pronouns like "it" using conversation history.
-
 Context:
 ${webContext}
 
